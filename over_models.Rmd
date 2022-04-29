@@ -1,0 +1,968 @@
+---
+title: "Untitled"
+author: "Spencer Kerch"
+date: "2/7/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+library(jsonlite)
+library(tidyverse)
+library(tidyr)
+library(dplyr)
+library(dbplyr)
+library(purrr)
+library(AICcmodavg)
+library(gains)
+library(scales)
+library(xgboost)
+library(tidymodels)
+library(dials)
+library(splitTools)
+library(MLmetrics)
+library(caret)
+library(stats)
+library(gains)
+```
+
+```{r}
+read_data_raw<- function(y1,y2) {
+  raw_scores_y1_y2 <- read.csv(paste0("raw_scores_",y1,"_",y2,".txt")) 
+  raw_scores_y1_y2 <- raw_scores_y1_y2 %>% mutate(season = paste0(y1,"_",y2))
+  return(raw_scores_y1_y2)
+}
+
+
+read_data_vegas<- function(y1,y2) {
+  vegas_y1_y2 <- read.csv(paste0("vegas_",y1,"_",y2,".txt"))
+  return(vegas_y1_y2)
+}
+
+vals <- 12:18
+df <- map_df(vals, 
+             ~inner_join(read_data_raw(.x,.x + 1), 
+                         read_data_vegas(.x,.x + 1),
+                          by = c("TEAM_ID" = "TeamId","GAME_ID"="GameId")))
+```
+
+
+time to get the data we want to use for the model
+```{r}
+df <- df %>% 
+  mutate(game_code = paste0(GAME_ID,"_",TEAM_ID)) %>%
+  select("date" = X, GAME_ID, TEAM_ID,game_code,season, TEAM_ABBREVIATION, TEAM_WINS_LOSSES, PTS,FG_PCT, FT_PCT,FG3_PCT,AST,REB,TOV,Average_Line_Spread,Average_Line_OU,Result,Total)
+
+df <- df %>% mutate(over = ifelse(Total > Average_Line_OU,1,0),
+                    Wins = as.integer(str_extract(TEAM_WINS_LOSSES, "^\\d+")),
+                    Loss = as.integer(str_extract(TEAM_WINS_LOSSES, "\\d+$")),
+                    Wins = ifelse(Result == "W",Wins - 1, Wins),
+                    Loss = ifelse(Result == "L",Loss - 1, Loss),
+                    games_played = Wins + Loss,
+                    pts_allowed = Total-PTS,
+                    abs_val_avg_spread = abs(Average_Line_Spread))%>%
+  group_by(season,TEAM_ID) %>%
+  mutate(
+  prev_game_pts = lag(PTS, default = 0),
+  ppg = cumsum(prev_game_pts)/games_played,
+  prev_game_fgpct = lag(FG_PCT, default = 0),
+  season_fg_pct = cumsum(prev_game_fgpct)/games_played,
+  prev_game_ftpct = lag(FT_PCT, default = 0),
+  season_ft_pct = cumsum(prev_game_ftpct)/games_played,
+  prev_game_3pct = lag(FG3_PCT, default = 0),
+  season_3pct = cumsum(prev_game_3pct)/games_played,
+  prev_ast = lag(AST, default = 0),
+  APG = cumsum(prev_ast)/games_played,
+  prev_reb = lag(REB, default = 0),
+  RPG = cumsum(prev_reb)/games_played,
+  prev_to = lag(TOV, default = 0),
+  TOVPG = cumsum(prev_to)/games_played,
+  prev_pts_allow = lag(pts_allowed, default = 0),
+  pts_allowed_per_game = cumsum(pts_allowed)/games_played,
+  w_per = Wins/games_played) %>%
+  ungroup() %>%
+  select(-c(cols = starts_with("prev"))) %>%
+  group_by(GAME_ID,season)%>%
+  mutate(opponent = lead(TEAM_ABBREVIATION),
+         opp_ppg = lead(ppg),
+         opp_wins = lead(Wins),
+         opp_fgpct = lead(season_fg_pct),
+         opp_3pct = lead(season_3pct),
+         opp_pa = lead(pts_allowed_per_game),
+         opp_rpg = lead(RPG),
+         opp_apg = lead(APG),
+         opp_topg = lead(TOVPG),
+         opp_gp = lead(games_played),
+         opp_wp = lead(w_per),
+         ) %>%
+  ungroup()%>%
+  select(-c(TEAM_WINS_LOSSES,PTS,FG_PCT,FT_PCT,FG3_PCT,AST,REB,TOV,Result,Loss,games_played,opp_gp,pts_allowed)) %>%
+  na.omit()
+
+df<- df%>%
+  mutate(tot_ppg = ppg+opp_ppg,
+         tot_wp = w_per +opp_wp,
+         tot_fgpct = season_fg_pct+opp_fgpct,
+         tot_3pct = opp_3pct+season_3pct,
+         tot_pa = opp_pa +pts_allowed_per_game,
+         tot_rpg = RPG + opp_rpg,
+         tot_apg = APG +opp_apg,
+         tot_topg = TOVPG + opp_topg,
+         )
+
+```
+
+```{r}
+library(GGally)
+ df %>%
+  select(-c(date,GAME_ID,TEAM_ID,game_code,season,TEAM_ABBREVIATION,over,Average_Line_Spread,opponent,Total)) %>%
+  cor()
+ 
+ 
+ lin_reg_df <- df %>%
+  select(-c(Average_Line_Spread, GAME_ID, TEAM_ID,Total,Wins,))
+ 
+ 
+
+lin_reg_df$over <- as.character(lin_reg_df$over)
+cols <- sapply(lin_reg_df, is.numeric)
+lin_reg_df[cols] <- scale(lin_reg_df[cols])
+colMeans(lin_reg_df[cols])
+apply(lin_reg_df[cols], 2, sd)
+library(rsample)
+lin_reg_df$over <- as.numeric(lin_reg_df$over)
+cols <- sapply(lin_reg_df, is.numeric)
+cols[2] <- T
+
+
+lin_reg_df[ , c(5:16,19:34) ][ lin_reg_df[ , c(5:16,19:34) ] >= 3 ] <- 3
+
+lin_reg_df[ , c(5:16,19:34) ][ lin_reg_df[ , c(5:16,19:34) ] <= -3 ] <- -3
+
+
+set.seed(1)
+split_norm <- initial_split(lin_reg_df[cols],.75)
+train<-training(split_norm)
+test<-testing(split_norm)
+write_csv(test,"test.csv")
+write_csv(train,"train.csv")
+
+
+```
+
+```{r}
+
+train.log1 <- glm(over~.,family = "binomial",data = train[,-1])
+summary(train.log1)
+pred1 <- predict(train.log1,train,type = "response")
+
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred1>=.5,1,0)))
+
+
+
+train.log2 <- glm(over~.-season_ft_pct-opp_wins,family = "binomial",data = train[,-1])
+summary(train.log2)
+pred2 <- predict(train.log2,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred2>=.5,1,0)))
+
+
+train.log3 <- glm(over~.-season_ft_pct-opp_wins-opp_fgpct-season_fg_pct,family = "binomial",data = train[,-1])
+summary(train.log3)
+pred3 <- predict(train.log3,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred3>=.5,1,0)))
+
+train.log4 <- glm(over~.-season_ft_pct-opp_wins-opp_fgpct-season_fg_pct-TOVPG-opp_topg,family = "binomial",data = train[,-1])
+summary(train.log4)
+pred4 <- predict(train.log4,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred4>=.5,1,0)))
+#accuracy=.5233
+
+train.log5 <- glm(over~.-season_ft_pct-opp_wins-opp_fgpct-season_fg_pct-TOVPG-opp_topg-APG-opp_apg
+                  ,family = "binomial",data = train[,-1])
+summary(train.log5)
+pred5 <- predict(train.log5,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred5>=.5,1,0)))
+#accuracy=.5211
+
+train.log6 <- glm(over~.-season_ft_pct-opp_wins-opp_fgpct-season_fg_pct-TOVPG-opp_topg-APG-opp_apg-w_per-opp_wp
+                  ,family = "binomial",data = train[,-1])
+summary(train.log6)
+pred6<- predict(train.log6,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred6>=.5,1,0)))
+#accuracy=0.5269
+
+
+train.log7 <- glm(over~.-season_ft_pct-opp_wins-opp_fgpct-season_fg_pct-TOVPG-opp_topg-APG-opp_apg-w_per-opp_wp - Average_Line_OU,
+                    family = "binomial",data = train[,-1])
+summary(train.log7)
+pred7<- predict(train.log7,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred7>=.5,1,0)))
+#accuracy=0.5272
+
+train.log8 <- glm(over~.-season_ft_pct-opp_wins-opp_fgpct-season_fg_pct-TOVPG-opp_topg-APG-opp_apg-w_per-opp_wp - Average_Line_OU-pts_allowed_per_game-opp_pa,
+                    family = "binomial",data = train[,-1])
+summary(train.log8)
+pred8<- predict(train.log8,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred8>=.5,1,0)))
+#accuracy=0.514
+
+train.log9 <- glm(over~.-season_ft_pct-opp_wins-opp_fgpct-season_fg_pct-TOVPG-opp_topg-APG-opp_apg-w_per-opp_wp - season_3pct - opp_3pct-Average_Line_OU,
+                    family = "binomial",data = train[,-1])
+summary(train.log9)
+pred9<- predict(train.log9,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred9>=.5,1,0)))
+#accuracy=0.5289
+
+train.log10 <- glm(over~.-season_ft_pct-opp_wins-opp_fgpct-season_fg_pct-TOVPG-opp_topg-APG-opp_apg-w_per-opp_wp - season_3pct - opp_3pct-Average_Line_OU-abs_val_avg_spread,
+                    family = "binomial",data = train[,-1])
+summary(train.log10)
+pred10<- predict(train.log10,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred10>=.5,1,0)))
+#accuracy=0.5275
+
+train.log11<- glm(over~.-season_ft_pct-opp_wins-opp_fgpct-season_fg_pct-TOVPG-opp_topg-APG-opp_apg-w_per-opp_wp - season_3pct - opp_3pct-Average_Line_OU-abs_val_avg_spread-pts_allowed_per_game-opp_pa,
+                    family = "binomial",data = train[,-1])
+summary(train.log11)
+pred11<- predict(train.log11,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred11>=.5,1,0)))
+#accuracy=0.5275
+
+
+train.log_tot1<- glm(over~tot_ppg+tot_wp+tot_fgpct+tot_3pct+tot_pa+tot_topg+tot_rpg+tot_apg+Average_Line_OU+abs_val_avg_spread,
+                    family = "binomial",data = train[,-1])
+summary(train.log_tot1)
+pred_tot1<- predict(train.log_tot1,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred_tot1>=.5,1,0)))
+
+train.log_tot2<- glm(over~tot_ppg+tot_wp+tot_fgpct+tot_3pct+tot_pa+tot_topg+tot_rpg+Average_Line_OU+abs_val_avg_spread,
+                    family = "binomial",data = train[,-1])
+summary(train.log_tot2)
+pred_tot2<- predict(train.log_tot2,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred_tot2>=.5,1,0)))
+
+train.log_tot3<- glm(over~tot_ppg+tot_wp+tot_fgpct+tot_pa+tot_topg+tot_rpg+Average_Line_OU+abs_val_avg_spread,
+                    family = "binomial",data = train[,-1])
+summary(train.log_tot3)
+pred_tot3<- predict(train.log_tot3,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred_tot3>=.5,1,0)))
+
+
+train.log_tot4<- glm(over~tot_ppg+tot_wp+tot_fgpct+tot_pa+tot_rpg+Average_Line_OU+abs_val_avg_spread,
+                    family = "binomial",data = train[,-1])
+summary(train.log_tot4)
+pred_tot4<- predict(train.log_tot4,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred_tot4>=.5,1,0)))
+
+train.log_tot5<- glm(over~tot_ppg+tot_wp+tot_pa+tot_rpg+Average_Line_OU+abs_val_avg_spread,
+                    family = "binomial",data = train[,-1])
+summary(train.log_tot5)
+pred_tot5<- predict(train.log_tot5,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred_tot5>=.5,1,0)))
+
+
+train.log_tot6<- glm(over~tot_ppg+tot_wp+tot_fgpct+tot_pa+tot_rpg,
+                    family = "binomial",data = train)
+summary(train.log_tot6)
+pred_tot6<- predict(train.log_tot6,train,type = "response")
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(pred_tot6>=.5,1,0)))
+
+models = list(train.log1,train.log2,train.log3,train.log4,train.log5,train.log6,train.log7,train.log8,train.log9,train.log10,train.log11)
+aictab(models)
+models2 = list(train.log_tot1,train.log_tot2,train.log_tot3,train.log_tot4,train.log_tot5,train.log_tot6)
+
+aic_table<-aictab(models2)
+
+```
+
+Looking at the AIC of each model, I see that model 10 has the lowest, and it is not close . I will choose to go with model 10 moving forward as, while while all the models have similar success rate, the AIC shows how flexible the model is. Otherwise, how the model accounts for variance with fewer predictors. Even though 10 has a variable with a significantly lower significance level, I choose to keep it because it does not make logical sense to remove pts_allowed_per_game without removing opp_pa per game. These are the same stat for different teams and one without the other would be illogical. Also, I tried removing both and that raised the AIC.
+
+After writing that I realized I could make a composite variable combining the values for each predictor for each team involved, doing so helped create a better model with lower AIC - train.log_tot6. I will use this one in the future
+
+```{r}
+LogLoss(pred_tot1,train$over)
+LogLoss(pred_tot2,train$over)
+LogLoss(pred_tot3,train$over)
+LogLoss(pred_tot4,train$over)
+LogLoss(pred_tot5,train$over)
+LogLoss(pred_tot6,train$over)
+```
+
+```{r}
+train.preds <-bind_cols(train$game_code ,train$over,pred_tot6) %>%
+  rename("game_code"=...1 , "over"=...2  ,"pred_tot6"=...3)
+
+plot1<-train.preds %>%
+  mutate(bin_pred_prob = round(pred_tot6/.05)*.05)%>%
+  group_by(bin_pred_prob)%>%
+  summarise(n_games = n(),
+            n_overs = length(which(over==1)),
+            bin_act_prob = n_overs/n_games,
+            )%>%
+  ungroup()
+
+ann_text <- data.frame(
+  x = c(.25, 0.75), y = c(0.75, 0.25),
+  lab = c("More times\nthan expected", "Fewer times\nthan expected")
+)
+
+cal_plot1<-plot1 %>%
+  ggplot() +
+  geom_point(aes(x = bin_pred_prob, y = bin_act_prob, size = n_overs)) +
+  geom_smooth(aes(x = bin_pred_prob, y = bin_act_prob), method = "loess", color = "orange") +
+  geom_abline(slope = 1, intercept = 0, color = "black", lty = 2) +
+  coord_equal() +
+  scale_x_continuous(limits = c(.4, .80),) +
+  scale_y_continuous(limits = c(.4, .80)) +
+  labs(
+    size = "Number of games",
+    x = "Estimated over probability",
+    y = "Observed over probability",
+    title = "Model 6 Calibration Plot"
+  ) +
+  geom_text(data = ann_text, aes(x = x, y = y, label = lab), size = 2) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10, angle = 90),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+as.data.frame(train.log_tot6$coefficients) %>% 
+  mutate(odds = exp(train.log_tot6$coefficients),
+         prob = odds/(1+odds))
+```
+
+
+
+```{r}
+df <- left_join(df,train.preds, by = c("game_code","over")) 
+```
+
+```{r}
+xgtrain <- train %>% select(tot_ppg , tot_wp , tot_fgpct , tot_pa , tot_rpg)
+xglabel <- train %>% select(over)
+```
+
+
+```{r}
+
+#thanks ben baldwin
+
+set.seed(72)
+folds <- create_folds(
+  y = sequence(length(xgtrain$tot_ppg)),
+  k = 10,
+  type = "basic",
+  invert = TRUE,
+  
+)
+
+str(folds)
+
+
+
+grid <- grid_latin_hypercube(
+  # this finalize thing is because mtry depends on # of columns in data
+  finalize(dials::mtry(), xgtrain),
+  min_n(),
+  tree_depth(),
+  learn_rate(range = c(-1.5, -0.5), trans = scales::log10_trans()),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  size = 100
+) %>%
+  mutate(
+    # has to be between 0 and 1 for xgb
+    # for some reason mtry gives the number of columns rather than proportion
+    mtry = mtry / length(xgtrain)
+    ) %>%
+  # make these the right names for xgb
+  dplyr::rename(
+    eta = learn_rate,
+    gamma = loss_reduction,
+    subsample = sample_size,
+    colsample_bytree = mtry,
+    max_depth = tree_depth,
+    min_child_weight = min_n
+  )
+
+
+```
+
+
+
+
+```{r}
+get_row <- function(row) {
+params <-
+    list(
+      booster = "gbtree",
+      objective = "binary:logistic",
+      eval_metric = c("logloss"),
+      eta = row$eta,
+      gamma = row$gamma,
+      subsample = row$subsample,
+      colsample_bytree = row$colsample_bytree,
+      max_depth = row$max_depth,
+      min_child_weight = row$min_child_weight
+    )
+
+  # do the cross validation
+  wp_cv_model <- xgb.cv(
+    data = as.matrix(xgtrain),
+    label = xglabel$over,
+    params = params,
+    # this doesn't matter with early stopping in xgb.cv, just set a big number
+    # the actual optimal rounds will be found in this tuning process
+    nrounds = 15000,
+    # created above
+    folds = folds,
+    metrics = list("logloss"),
+    early_stopping_rounds = 50,
+    print_every_n = 50,
+    verbose = F
+  )
+
+  # bundle up the results together for returning
+  output <- params
+  output$iter <- wp_cv_model$best_iteration
+  output$logloss <- wp_cv_model$evaluation_log[output$iter]$test_logloss_mean
+
+  row_result <- bind_rows(output)
+
+  return(row_result)
+}
+```
+
+
+
+```{r}
+
+results <- map_df(1:nrow(grid), function(x){get_row(grid %>% dplyr::slice(x))})
+
+```
+
+```{r}
+results %>%
+  dplyr::select(logloss, eta, gamma, subsample, colsample_bytree, max_depth, min_child_weight) %>%
+  tidyr::pivot_longer(
+    eta:min_child_weight,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, logloss, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE, size = 3) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "logloss") +
+  theme_minimal()
+```
+
+
+
+
+```{r}
+grid <- grid_latin_hypercube(
+  # this finalize thing is because mtry depends on # of columns in data
+  mtry(range = c(length(xgtrain)*.6,length(xgtrain))),
+  min_n(),
+  tree_depth(range = c(2,6)),
+  learn_rate(range = c(-1.5, -0.5), trans = scales::log10_trans()),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  size = 100
+) %>%
+  mutate(
+    # has to be between 0 and 1 for xgb
+    # for some reason mtry gives the number of columns rather than proportion
+    mtry = mtry / length(xgtrain)
+    ) %>%
+  # make these the right names for xgb
+  dplyr::rename(
+    eta = learn_rate,
+    gamma = loss_reduction,
+    subsample = sample_size,
+    colsample_bytree = mtry,
+    max_depth = tree_depth,
+    min_child_weight = min_n
+  )
+
+results <- map_df(1:nrow(grid), function(x){get_row(grid %>% dplyr::slice(x))})
+
+
+```
+
+
+```{r}
+results %>%
+  dplyr::select(logloss, eta, gamma, subsample, colsample_bytree, max_depth, min_child_weight) %>%
+  tidyr::pivot_longer(
+    eta:min_child_weight,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, logloss, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE, size = 3) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "logloss") +
+  theme_minimal()
+```
+
+
+
+
+```{r}
+best_model <- results %>%
+  arrange(logloss) %>%
+  dplyr::slice(1)
+
+params <-
+  list(
+    booster = "gbtree",
+    objective = "binary:logistic",
+    eval_metric = c("logloss"),
+    eta = best_model$eta,
+    gamma = best_model$gamma,
+    subsample = best_model$subsample,
+    colsample_bytree = best_model$colsample_bytree,
+    max_depth = best_model$max_depth,
+    min_child_weight = best_model$min_child_weight
+  )
+
+nrounds <- best_model$iter
+
+xg_boosted_tree1 <- xgboost(params = params,
+                           data=as.matrix(xgtrain),
+                           label = xglabel$over,
+                           verbose = 2,
+                           nrounds = nrounds
+                           )
+```
+
+
+
+```{r}
+importance <- xgb.importance(
+  feature_names = colnames(xg_boosted_tree1),
+  model = xg_boosted_tree1
+)
+xgb.ggplot.importance(importance_matrix = importance) + theme(legend.position = "none")
+```
+
+
+
+```{r}
+xg1.preds <- predict(xg_boosted_tree1,as.matrix(xgtrain)) %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(xgb1 = value)
+
+xg1.preds <-bind_cols(train$game_code ,train$over,xg1.preds) %>%
+  rename("game_code"=...1 , "over"=...2)
+
+plot2<-xg1.preds %>%
+  mutate(bin_pred_prob = round(xgb1/.05)*.05)%>%
+  group_by(bin_pred_prob)%>%
+  summarise(n_games = n(),
+            n_overs = length(which(over==1)),
+            bin_act_prob = n_overs/n_games,
+            )%>%
+  ungroup()
+
+ann_text <- data.frame(
+  x = c(.25, 0.75), y = c(0.75, 0.25),
+  lab = c("More times\nthan expected", "Fewer times\nthan expected")
+)
+
+cal_plot_xgboost<-plot2 %>%
+  ggplot() +
+  geom_point(aes(x = bin_pred_prob, y = bin_act_prob, size = n_overs)) +
+  geom_smooth(aes(x = bin_pred_prob, y = bin_act_prob), method = "loess", color = "orange") +
+  geom_abline(slope = 1, intercept = 0, color = "black", lty = 2) +
+  coord_equal() +
+  scale_x_continuous(limits = c(.3, .75),) +
+  scale_y_continuous(limits = c(.3, .75)) +
+  labs(
+    size = "Number of games",
+    x = "Estimated over probability",
+    y = "Observed over probability",
+    title = "XGBoost Calibration Plot"
+  ) +
+  geom_text(data = ann_text, aes(x = x, y = y, label = lab), size = 2) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10, angle = 90),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+```
+
+```{r}
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(xg1.preds$xgb1>=.5,1,0)))
+
+```
+
+```{r}
+get_row2 <- function(row) {
+params <-
+    list(
+      booster = "gbtree",
+      objective = "binary:logistic",
+      eval_metric = c("logloss"),
+      eta = row$eta,
+      gamma = row$gamma,
+      subsample = row$subsample,
+      colsample_bytree = row$colsample_bytree,
+      max_depth = row$max_depth,
+      min_child_weight = row$min_child_weight
+    )
+
+  # do the cross validation
+  wp_cv_model <- xgb.cv(
+    data = as.matrix(xgtrain2),
+    label = xglabel$over,
+    params = params,
+    # this doesn't matter with early stopping in xgb.cv, just set a big number
+    # the actual optimal rounds will be found in this tuning process
+    nrounds = 15000,
+    # created above
+    folds = folds,
+    metrics = list("logloss"),
+    early_stopping_rounds = 50,
+    #print_every_n = 50
+    verbose = F
+  )
+
+  # bundle up the results together for returning
+  output <- params
+  output$iter <- wp_cv_model$best_iteration
+  output$logloss <- wp_cv_model$evaluation_log[output$iter]$test_logloss_mean
+
+  row_result <- bind_rows(output)
+
+  return(row_result)
+}
+```
+
+```{r}
+xgtrain2 <- train %>% select(tot_ppg , tot_wp , tot_fgpct , tot_pa , tot_rpg, Average_Line_OU, 
+                             abs_val_avg_spread, tot_apg,tot_topg,tot_3pct)
+
+
+grid2 <- grid_latin_hypercube(
+  # this finalize thing is because mtry depends on # of columns in data
+  finalize(dials::mtry(), xgtrain2),
+  min_n(),
+  tree_depth(),
+  learn_rate(range = c(-1.5, -0.5), trans = scales::log10_trans()),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  size = 100
+) %>%
+  mutate(
+    # has to be between 0 and 1 for xgb
+    # for some reason mtry gives the number of columns rather than proportion
+    mtry = mtry / length(xgtrain2)
+    ) %>%
+  # make these the right names for xgb
+  dplyr::rename(
+    eta = learn_rate,
+    gamma = loss_reduction,
+    subsample = sample_size,
+    colsample_bytree = mtry,
+    max_depth = tree_depth,
+    min_child_weight = min_n
+  )
+```
+
+
+```{r}
+results2 <- map_df(1:nrow(grid2), function(x){get_row2(grid2 %>% dplyr::slice(x))})
+```
+
+```{r}
+results2 %>%
+  dplyr::select(logloss, eta, gamma, subsample, colsample_bytree, max_depth, min_child_weight) %>%
+  tidyr::pivot_longer(
+    eta:min_child_weight,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, logloss, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE, size = 3) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "logloss") +
+  theme_minimal()
+```
+
+```{r}
+grid2 <- grid_latin_hypercube(
+  # this finalize thing is because mtry depends on # of columns in data
+  mtry(range = c(5,9)), 
+  min_n(),
+  tree_depth(range = c(2,7)),
+  learn_rate(range = c(-1.5, -0.5), trans = scales::log10_trans()),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  size = 100
+) %>%
+  mutate(
+    # has to be between 0 and 1 for xgb
+    # for some reason mtry gives the number of columns rather than proportion
+    mtry = mtry / length(xgtrain2)
+    ) %>%
+  # make these the right names for xgb
+  dplyr::rename(
+    eta = learn_rate,
+    gamma = loss_reduction,
+    subsample = sample_size,
+    colsample_bytree = mtry,
+    max_depth = tree_depth,
+    min_child_weight = min_n
+  )
+results2 <- map_df(1:nrow(grid2), function(x){get_row2(grid2 %>% dplyr::slice(x))})
+
+```
+
+
+```{r}
+results2 %>%
+  dplyr::select(logloss, eta, gamma, subsample, colsample_bytree, max_depth, min_child_weight) %>%
+  tidyr::pivot_longer(
+    eta:min_child_weight,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, logloss, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE, size = 3) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "logloss") +
+  theme_minimal()
+```
+
+```{r}
+best_model2 <- results2 %>%
+  arrange(logloss) %>%
+  dplyr::slice(1)
+
+params <-
+  list(
+    booster = "gbtree",
+    objective = "binary:logistic",
+    eval_metric = c("logloss"),
+    eta = best_model2$eta,
+    gamma = best_model2$gamma,
+    subsample = best_model2$subsample,
+    colsample_bytree = best_model2$colsample_bytree,
+    max_depth = best_model2$max_depth,
+    min_child_weight = best_model2$min_child_weight
+  )
+
+nrounds <- best_model2$iter
+
+xg_boosted_tree2 <- xgboost(params = params,
+                           data=as.matrix(xgtrain2),
+                           label = xglabel$over,
+                           verbose = 2,
+                           nrounds = nrounds
+                           )
+importance2 <- xgb.importance(
+  model = xg_boosted_tree2,
+  feature_names = xg_boosted_tree2$feature_names
+  
+)
+xgb.ggplot.importance(importance_matrix = importance2, top_n = 10)
+
+
+```
+
+```{r}
+xg2.preds <- predict(xg_boosted_tree2,as.matrix(xgtrain2)) %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(xgb2 = value)
+
+xg2.preds <-bind_cols(train$game_code ,train$over,xg2.preds) %>%
+  rename("game_code"=...1 , "over"=...2)
+
+plot3<-xg2.preds %>%
+  mutate(bin_pred_prob = round(xgb2/.02)*.02)%>%
+  group_by(bin_pred_prob)%>%
+  summarise(n_games = n(),
+            n_overs = length(which(over==1)),
+            bin_act_prob = n_overs/n_games,
+            )%>%
+  ungroup()
+
+ann_text <- data.frame(
+  x = c(.25, 0.75), y = c(0.75, 0.25),
+  lab = c("More times\nthan expected", "Fewer times\nthan expected")
+)
+
+plot3 %>%
+  ggplot() +
+  geom_point(aes(x = bin_pred_prob, y = bin_act_prob, size = n_overs)) +
+  geom_smooth(aes(x = bin_pred_prob, y = bin_act_prob), method = "loess") +
+  geom_abline(slope = 1, intercept = 0, color = "black", lty = 2) +
+  coord_equal() +
+  scale_x_continuous(limits = c(.3, .7),) +
+  scale_y_continuous(limits = c(.3, .7)) +
+  labs(
+    size = "Number of games",
+    x = "Estimated over probability",
+    y = "Observed over probability",
+    title = "over calibration plot"
+  ) +
+  geom_text(data = ann_text, aes(x = x, y = y, label = lab), size = 2) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10, angle = 90),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.position = "bottom"
+  )
+caret::confusionMatrix(as.factor(train$over),as.factor(if_else(xg2.preds$xgb2>=.5,1,0)))
+
+```
+After tuning and running both trees I have determined to use the first tree. The results from the second tree were interesting with the variables it found important, but I will use the first tree to compare better to my logistic regression. As of right now it appears the XG tree will work better. It is more accurate and has a slightly smaller logloss than the logisitic regression.
+
+```{r}
+gains <- gains(train$over, xg1.preds$xgb1, groups = 100)
+plot(c(0,gains$cume.pct.of.total*sum(train$over))~c(0,gains$cume.obs),xlab = "Total Games", ylab = "Total Overs", type = "l")
+lines(c(0,sum(train$over))~c(0,dim(train)[1]), lty = 2)
+
+gains <- gains(train$over, train.preds$pred_tot6,groups = 100)
+plot(c(0,gains$cume.pct.of.total*sum(train$over))~c(0,gains$cume.obs),xlab = "Total Games", ylab = "Total Overs", type = "l")
+lines(c(0,sum(train$over))~c(0,dim(train)[1]), lty = 2)
+
+
+```
+
+
+Test time
+```{r}
+
+
+test_lin_pred <- predict(train.log_tot6,test,type = "response")
+caret::confusionMatrix(as.factor(if_else(test_lin_pred>=.5,1,0)),as.factor(test$over))
+
+xgtest <- test %>% select(tot_ppg , tot_wp , tot_fgpct , tot_pa , tot_rpg)
+
+test_xg_pred <- predict(xg_boosted_tree1,as.matrix(xgtest), type = "response")
+caret::confusionMatrix(as.factor(if_else(test_xg_pred>=.5,1,0)),as.factor(test$over))
+
+
+```
+```{r}
+
+
+
+
+xg.preds_test <- test_xg_pred %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(xgb = value)
+
+xg.preds_test <-bind_cols(test$game_code ,test$over,xg.preds_test) %>%
+  rename("game_code"=...1 , "over"=...2)
+
+plot_xgtest<-xg.preds_test %>%
+  mutate(bin_pred_prob = round(xgb/.02)*.02)%>%
+  group_by(bin_pred_prob)%>%
+  summarise(n_games = n(),
+            n_overs = length(which(over==1)),
+            bin_act_prob = n_overs/n_games,
+            )%>%
+  ungroup()
+
+cal_plot_xgboost_test<- plot_xgtest %>%
+  ggplot() +
+  geom_point(aes(x = bin_pred_prob, y = bin_act_prob, size = n_overs)) +
+  geom_smooth(aes(x = bin_pred_prob, y = bin_act_prob), method = "loess", color = "orange") +
+  geom_abline(slope = 1, intercept = 0, color = "black", lty = 2) +
+  coord_equal() +
+  scale_x_continuous(limits = c(.3, .75),) +
+  scale_y_continuous(limits = c(.3, .75)) +
+  labs(
+    size = "Number of games",
+    x = "Estimated over probability",
+    y = "Observed over probability",
+    title = "XGBoost Calibration Plot"
+  ) +
+  geom_text(data = ann_text, aes(x = x, y = y, label = lab), size = 2) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10, angle = 90),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+```
+
+```{r}
+lin.preds_test <- test_lin_pred %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(lin_pred = value)
+
+lin.preds_test <-bind_cols(test$game_code ,test$over,lin.preds_test) %>%
+  rename("game_code"=...1 , "over"=...2)
+
+plot_lin_test<-lin.preds_test %>%
+  mutate(bin_pred_prob = round(lin_pred/.02)*.02)%>%
+  group_by(bin_pred_prob)%>%
+  summarise(n_games = n(),
+            n_overs = length(which(over==1)),
+            bin_act_prob = n_overs/n_games,
+            )%>%
+  ungroup()
+
+cal_plot_lin_test <-plot_lin_test %>%
+  ggplot() +
+  geom_point(aes(x = bin_pred_prob, y = bin_act_prob, size = n_overs)) +
+  geom_smooth(aes(x = bin_pred_prob, y = bin_act_prob), method = "loess", color = "orange") +
+  geom_abline(slope = 1, intercept = 0, color = "black", lty = 2) +
+  coord_equal() +
+  scale_x_continuous(limits = c(.3, .75),) +
+  scale_y_continuous(limits = c(.3, .75)) +
+  labs(
+    size = "Number of games",
+    x = "Estimated over probability",
+    y = "Observed over probability",
+    title = "Linear Calibration Plot"
+  ) +
+  geom_text(data = ann_text, aes(x = x, y = y, label = lab), size = 2) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10, angle = 90),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.position = "bottom"
+  )
+```
+

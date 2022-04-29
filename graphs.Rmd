@@ -1,0 +1,38 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+table1<-aic_table%>%
+  select(c(Modnames,K,AICc,Delta_AICc,AICcWt))%>%
+gt() %>%
+    cols_label(Modnames = "Models",
+               K = "Features",
+               AICc = "AIC",
+               Delta_AICc = "AIC Difference",
+               AICcWt = "AIC Weight") %>%
+    tab_header(title = "Linear Model Performance", subtitle = "on the training set") %>%
+    fmt_percent(columns = AICcWt) %>%
+    fmt_number(columns = c(AICc,Delta_AICc))%>%
+    tab_style(locations = cells_column_labels(columns = everything()),
+              style = list(
+                cell_borders(sides = "bottom", weight = px(3)),
+                cell_text(weight = "bold")
+              )
+    ) %>%
+    tab_style(locations = cells_title(groups = "title"),
+              style = list(cell_text(weight = "bold", size = 24))
+    ) %>%
+  data_color(columns = AICcWt, colors = scales::col_numeric(palette = c("moccasin","orange2"), domain = c(0,1)))
+```
+
+```{r}
+xg_imp_plot <- importance%>%
+  ggplot(aes(x=Importance, y = fct_reorder(Feature,Importance)))+
+  geom_col(fill = "orange") + 
+  labs(y = "Features", title = "Feature Importance")+
+  theme_bw()
+  
+  
+```
+
